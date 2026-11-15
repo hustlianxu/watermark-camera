@@ -23,6 +23,7 @@ export interface RecordItem {
   originalKey: string;
   renderKey: string;
   createdAt: number;
+  updatedAt?: number;
   capturedAt?: number;
   watermarkRemoved?: boolean;
 }

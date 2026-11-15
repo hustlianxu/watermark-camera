@@ -53,6 +53,10 @@ function canAccessFolder(req: any, id: string): boolean {
   const u = currentUser(req);
   return u.role === 'admin' || !f.ownerId || f.ownerId === u.id;
 }
+function imageVersion(r: any): number { return Number(r.updatedAt || r.createdAt || 0); }
+function imageUrlFor(r: any): string { return `/api/files/render/${r.id}?v=${imageVersion(r)}`; }
+function thumbUrlFor(r: any): string { return `/api/files/thumb/${r.id}?v=${imageVersion(r)}`; }
+
 function visibleRecord(req: any, id: string) {
   const r = store.getRecord(id);
   return r && canAccessRecord(req, r) ? r : undefined;
@@ -285,7 +289,8 @@ app.get('/api/records', async (req, reply) => {
       width: r.width,
       height: r.height,
       createdAt: r.createdAt,
-      imageUrl: `/api/files/render/${r.id}`,
+      updatedAt: r.updatedAt,
+      imageUrl: imageUrlFor(r),
     })),
   };
 });
@@ -298,8 +303,8 @@ app.get('/api/records/:id', async (req, reply) => {
   return {
     ...r,
     template: getBuiltinTemplates().find((t) => t.id === r.templateId),
-    imageUrl: `/api/files/render/${r.id}`,
-    originalUrl: `/api/files/orig/${r.id}`,
+    imageUrl: imageUrlFor(r),
+    originalUrl: `/api/files/orig/${r.id}?v=${imageVersion(r)}`,
   };
 });
 
@@ -320,10 +325,10 @@ app.patch('/api/records/:id', async (req, reply) => {
     rendered = await renderRecord({ original, templateId: r.templateId, values, spec });
     await storage.putObject(r.renderKey, rendered.buffer!, { contentType: 'image/jpeg' });
   }
-  const updated = { ...r, folderId, values, spec, width: rendered.width, height: rendered.height, watermarkRemoved: visualChange ? false : r.watermarkRemoved };
+  const updated = { ...r, folderId, values, spec, width: rendered.width, height: rendered.height, watermarkRemoved: visualChange ? false : r.watermarkRemoved, updatedAt: visualChange ? Date.now() : (r.updatedAt || r.createdAt) };
   await store.updateRecord(updated);
   await invalidateThumb(id);
-  return { ...updated, imageUrl: `/api/files/render/${id}?v=${Date.now()}` };
+  return { ...updated, imageUrl: imageUrlFor(updated) };
 });
 
 app.post('/api/records', async (req, reply) => {
@@ -360,9 +365,10 @@ app.post('/api/records', async (req, reply) => {
     originalKey,
     renderKey,
     createdAt: Date.now(),
+    updatedAt: Date.now(),
   };
   await store.addRecord(record);
-  return reply.code(201).send({ ...record, imageUrl: `/api/files/render/${id}` });
+  return reply.code(201).send({ ...record, imageUrl: imageUrlFor(record) });
 });
 
 app.post('/api/records/:id/remove-watermark', async (req, reply) => {
@@ -373,10 +379,10 @@ app.post('/api/records/:id/remove-watermark', async (req, reply) => {
   const original = await buffer(await storage.getObject(r.originalKey));
   const clean = await renderClean(original);
   await storage.putObject(r.renderKey, clean.buffer, { contentType: 'image/jpeg' });
-  const updated = { ...r, width: clean.width, height: clean.height, watermarkRemoved: true };
+  const updated = { ...r, width: clean.width, height: clean.height, watermarkRemoved: true, updatedAt: Date.now() };
   await store.updateRecord(updated);
   await invalidateThumb(id);
-  return { ...updated, imageUrl: `/api/files/render/${id}?v=${Date.now()}` };
+  return { ...updated, imageUrl: imageUrlFor(updated) };
 });
 
 app.post('/api/records/:id/copy', async (req, reply) => {
@@ -396,10 +402,10 @@ app.post('/api/records/:id/copy', async (req, reply) => {
   await storage.putObject(renderKey, rendered, { contentType: 'image/jpeg' });
   const copy = {
     ...r, id: newId, originalKey, renderKey, ownerId: currentUser(req).id, folderId: body?.folderId || undefined,
-    createdAt: Date.now(), capturedAt: r.capturedAt,
+    createdAt: Date.now(), updatedAt: Date.now(), capturedAt: r.capturedAt,
   };
   await store.addRecord(copy);
-  return reply.code(201).send({ ...copy, imageUrl: `/api/files/render/${newId}` });
+  return reply.code(201).send({ ...copy, imageUrl: imageUrlFor(copy) });
 });
 
 app.delete('/api/records/:id', async (req, reply) => {
@@ -544,7 +550,8 @@ app.get('/api/files/thumb/:id', async (req, reply) => {
   const { id } = req.params as { id: string };
   const r = visibleRecord(req, id);
   if (!r) return reply.code(404).send({ error: 'NOT_FOUND' });
-  const key = `thumb/${id}.jpg`;
+  const version = String((req.query as any)?.v || '').replace(/[^0-9]/g, '').slice(0, 20);
+  const key = version ? `thumb/${id}-${version}.jpg` : `thumb/${id}.jpg`;
   try {
     await storage.headObject(key);
     return sendObject(reply, key, 'private, max-age=86400');
@@ -817,7 +824,7 @@ app.get('/s/:token', async (req, reply) => {
   if (!share) return reply.code(410).type('text/html').send('<h1>链接已过期</h1>');
   const records = share.recordIds.map((id) => store.getRecord(id)).filter(Boolean);
   const cards = records
-    .map((r) => `<figure><img src="/s/${token}/img/${r!.id}" alt=""><figcaption>${escapeHtml(r!.templateName)} · ${new Date(r!.createdAt).toLocaleString()}</figcaption></figure>`)
+    .map((r) => `<figure><img src="/s/${token}/img/${r!.id}?v=${imageVersion(r)}" alt=""><figcaption>${escapeHtml(r!.templateName)} · ${new Date(r!.createdAt).toLocaleString()}</figcaption></figure>`)
     .join('');
   reply.type('text/html').header('Cache-Control', 'no-store').send(`<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">

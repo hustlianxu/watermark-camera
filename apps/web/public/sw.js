@@ -1,5 +1,5 @@
-const CACHE = 'wc-shell-v4';
-const IMAGE_CACHE = 'wc-images-v2';
+const CACHE = 'wc-shell-v5';
+const IMAGE_CACHE = 'wc-images-v3';
 const ASSETS = ['/', '/manifest.webmanifest'];
 
 self.addEventListener('install', (e) => {

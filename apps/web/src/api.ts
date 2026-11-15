@@ -25,6 +25,6 @@ export interface Template {
 export interface FolderItem { id: string; name: string; createdAt: number; }
 export interface RecordItem {
   id: string; folderId?: string; templateId: string; templateName: string; values: Record<string,string>;
-  width: number; height: number; createdAt: number; imageUrl: string; originalUrl?: string;
+  width: number; height: number; createdAt: number; updatedAt?: number; imageUrl: string; originalUrl?: string;
   template?: Template; spec?: Record<string, unknown>;
 }

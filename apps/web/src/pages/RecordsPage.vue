@@ -56,7 +56,7 @@
         <div class="card record swipe-card" :class="{ swiped: swipedId === r.id }">
           <input v-if="selectMode" type="checkbox" :checked="selected.includes(r.id)" style="width:20px;height:20px" @click.stop @change="toggle(r.id, ($event.target as HTMLInputElement).checked)" />
           <router-link :to="`/records/${r.id}`" class="record" style="flex:1;min-width:0">
-            <img v-if="!missing.includes(r.id)" class="thumb" :src="`/api/files/thumb/${r.id}`" alt="" @error="markMissing(r.id)" />
+            <img v-if="!missing.includes(r.id)" class="thumb" :src="thumbUrl(r)" alt="" @error="markMissing(r.id)" />
             <div v-else class="thumb" style="display:flex;align-items:center;justify-content:center;font-size:11px;color:#888">图片丢失</div>
             <div class="meta">
               <h3>{{ r.values.modelo || r.templateName || '未命名' }}</h3>
@@ -140,6 +140,8 @@ async function load() {
     error.value = e.message || '加载失败';
   } finally { loading.value = false; }
 }
+
+function thumbUrl(r: RecordItem) { return `/api/files/thumb/${r.id}?v=${r.updatedAt || r.createdAt}`; }
 
 function markMissing(id: string) {
   if (!missing.value.includes(id)) missing.value = [...missing.value, id];

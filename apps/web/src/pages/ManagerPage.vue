@@ -36,7 +36,7 @@
         </div>
         <div v-for="r in records" :key="r.id" class="manager-tr">
           <input type="checkbox" :checked="selected.includes(r.id)" @change="toggle(r.id, ($event.target as HTMLInputElement).checked)" />
-          <img :src="`/api/files/thumb/${r.id}`" alt="" />
+          <img :src="thumbUrl(r)" alt="" />
           <div><b>{{ r.values.modelo || '未命名' }}</b><div class="hint">{{ r.templateName }} · {{ r.width }}×{{ r.height }}</div></div>
           <div>{{ folderName(r.folderId) }}</div>
           <div class="hint">{{ new Date(r.createdAt).toLocaleString() }}</div>
@@ -110,6 +110,7 @@ const toast = ref('');
 const location = window.location;
 const me = ref<{ id: string; username: string; role: string } | null>(null);
 
+function thumbUrl(r: RecordItem) { return `/api/files/thumb/${r.id}?v=${r.updatedAt || r.createdAt}`; }
 function folderName(id?: string) { return id ? folders.value.find((f) => f.id === id)?.name || '已删除文件夹' : '未分类'; }
 function countFolder(id: string) { return records.value.filter((r) => r.folderId === id).length; }
 function showToast(s: string) { toast.value = s; setTimeout(() => { toast.value = ''; }, 2500); }
