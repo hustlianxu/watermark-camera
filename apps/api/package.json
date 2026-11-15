@@ -1,0 +1,26 @@
+{
+  "name": "@wc/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.0.1",
+    "@fastify/multipart": "^9.0.1",
+    "@fastify/static": "^8.0.3",
+    "@napi-rs/canvas": "^0.1.65",
+    "@wc/core": "*",
+    "fastify": "^5.2.0",
+    "zod": "^3.24.1",
+    "@wc/storage": "*",
+    "archiver": "^7.0.1",
+    "exceljs": "^4.4.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "@types/archiver": "^6.0.3"
+  }
+}
