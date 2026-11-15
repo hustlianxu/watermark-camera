@@ -1,0 +1,14 @@
+services:
+  app:
+    build: .
+    image: watermark-camera:0.1
+    container_name: watermark-camera
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./data:/data
+      - ./apps:/app/apps
+      - ./packages:/app/packages
+    mem_limit: 700m
