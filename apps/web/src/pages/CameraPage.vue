@@ -139,6 +139,7 @@ import {
   cameraDiagnostics,
   cameraScopeProblem,
   describeCameraError,
+  readCameraScope,
   permissionProblem,
   queryCameraPermission,
   rememberCameraGrant,
@@ -281,7 +282,7 @@ function setZoom(n: number) { zoom.value = Math.min(4, Math.max(1, Math.round(n 
 async function startCamera() {
   cameraProblem.value = null;
   cameraActivation.value = false;
-  const scopeProblem = cameraScopeProblem(window);
+  const scopeProblem = cameraScopeProblem(readCameraScope(window, navigator));
   if (scopeProblem) {
     cameraProblem.value = scopeProblem;
     return;
@@ -307,7 +308,7 @@ async function startCamera() {
 }
 
 async function prepareCamera() {
-  const scopeProblem = cameraScopeProblem(window);
+  const scopeProblem = cameraScopeProblem(readCameraScope(window, navigator));
   if (scopeProblem) {
     cameraProblem.value = scopeProblem;
     return;

@@ -20,7 +20,28 @@ export interface CameraProblem {
 
 export interface CameraScope {
   isSecureContext: boolean;
+  mediaDevices: { getUserMedia?: unknown } | null;
+}
+
+export interface CameraWindow {
+  isSecureContext?: boolean;
+}
+
+export interface CameraNavigator {
   mediaDevices?: { getUserMedia?: unknown } | null;
+}
+
+/**
+ * 相机能力检测必须同时读 window 和 navigator：
+ * - isSecureContext 在 window 上；
+ * - mediaDevices / getUserMedia 只在 navigator 上，window.mediaDevices 恒为 undefined。
+ * 之前直接把 window 传给 cameraScopeProblem，导致 Chrome/Safari 都被误判为 unsupported。
+ */
+export function readCameraScope(win: CameraWindow, nav: CameraNavigator): CameraScope {
+  return {
+    isSecureContext: win.isSecureContext === true,
+    mediaDevices: nav.mediaDevices ?? null,
+  };
 }
 
 const CAMERA_GRANTED_KEY = 'wc:camera-granted';

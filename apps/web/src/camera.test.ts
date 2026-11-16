@@ -4,6 +4,7 @@ import {
   cameraScopeProblem,
   describeCameraError,
   permissionProblem,
+  readCameraScope,
 } from './camera';
 
 describe('camera error classification', () => {
@@ -52,6 +53,17 @@ describe('camera environment checks', () => {
 
   it('accepts a secure browser with getUserMedia', () => {
     expect(cameraScopeProblem({ isSecureContext: true, mediaDevices: { getUserMedia: () => {} } })).toBeNull();
+  });
+
+  it('reads mediaDevices from navigator, not window', () => {
+    const mediaDevices = { getUserMedia: () => {} };
+    const scope = readCameraScope({ isSecureContext: true }, { mediaDevices });
+    expect(scope.mediaDevices).toBe(mediaDevices);
+    expect(cameraScopeProblem(scope)).toBeNull();
+  });
+
+  it('keeps a missing navigator.mediaDevices unsupported', () => {
+    expect(cameraScopeProblem(readCameraScope({ isSecureContext: true }, {}))?.kind).toBe('unsupported');
   });
 });
 
