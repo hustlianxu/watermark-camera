@@ -73,7 +73,10 @@
       <div v-if="!exports.length" class="hint">暂无导出记录</div>
       <div v-for="e in exports" :key="e.id" class="export-row">
         <div><b>{{ e.type.toUpperCase() }}</b> · {{ e.count }} 张 <span class="hint">· {{ new Date(e.createdAt).toLocaleString() }}</span></div>
-        <div class="hint">状态：{{ e.status }} · 到期：{{ new Date(e.expiresAt).toLocaleString() }}<span v-if="e.error"> · {{ e.error }}</span></div>
+        <div class="hint">
+          状态：{{ e.status }} · 到期：{{ new Date(e.expiresAt).toLocaleString() }}<span v-if="e.error"> · {{ e.error }}</span>
+          <span v-if="e.translation"> · 已翻译 {{ e.translation.translated }} 条<span v-if="e.translation.failed">，{{ e.translation.failed }} 条失败</span></span>
+        </div>
         <div class="row">
           <button v-if="e.status === 'ready'" class="btn secondary" @click="downloadExport(e.id)">下载</button>
           <button class="btn danger" @click="deleteExport(e.id)">删除</button>

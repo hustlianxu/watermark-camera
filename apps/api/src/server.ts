@@ -13,9 +13,18 @@ import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 import { auth, hashPassword, verifyPassword } from './auth.js';
 import { randomBytes } from 'node:crypto';
-import { JsonStore, type ExportItem } from './store.js';
+import { JsonStore, type ExportItem, type ExportTranslationSummary } from './store.js';
 import { getBuiltinTemplates, renderClean, renderRecord } from './render.js';
 import { createStorage, storageConfigFromEnv } from '@wc/storage';
+import {
+  normalizeTranslationConfig,
+  resolveBilingualFields,
+  restoreWhitelist,
+  translationStatusText,
+  type BilingualResult,
+  type TranslateFn,
+  type TranslationConfig,
+} from './export-i18n.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '..', '..', '..');
@@ -68,6 +77,144 @@ const app = Fastify({ logger: true, bodyLimit: 2 * 1024 * 1024, trustProxy: true
 await app.register(cookie);
 await app.register(multipart, { limits: { fileSize: 30 * 1024 * 1024, files: 1 } });
 
+const FREE_DAILY_CHARS = 5000;
+const freeUsage = new Map<string, { date: string; chars: number }>();
+function freeCharsUsed(ownerId: string): number {
+  const today = new Date().toISOString().slice(0, 10);
+  const state = freeUsage.get(ownerId);
+  return state?.date === today ? state.chars : 0;
+}
+function addFreeChars(ownerId: string, chars: number): void {
+  const today = new Date().toISOString().slice(0, 10);
+  const used = freeCharsUsed(ownerId);
+  freeUsage.set(ownerId, { date: today, chars: used + chars });
+}
+
+async function callMyMemory(text: string, from: 'zh' | 'es', to: 'zh' | 'es'): Promise<string> {
+  const langpair = from === 'es' ? 'es|zh' : 'zh|es';
+  const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(langpair)}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+  if (!res.ok) throw new Error(`FREE_HTTP_${res.status}`);
+  const data = await res.json() as any;
+  const out = data?.responseData?.translatedText;
+  if (!out) throw new Error('FREE_EMPTY');
+  return String(out).trim();
+}
+
+async function callLlm(ownerId: string, text: string, from: 'zh' | 'es', to: 'zh' | 'es'): Promise<string> {
+  const settings = store.getUserSettings(ownerId).llm;
+  const base = settings?.baseURL || llmBase;
+  const key = settings?.apiKey || llmKey;
+  const model = settings?.model || llmModel;
+  if (!base || !key) throw new Error('LLM_NOT_CONFIGURED');
+  const fromLabel = from === 'es' ? 'Spanish' : 'Chinese';
+  const toLabel = to === 'zh' ? 'Chinese' : 'Spanish';
+  const res = await fetch(`${base}/chat/completions`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+    signal: AbortSignal.timeout(30000),
+    body: JSON.stringify({
+      model,
+      temperature: 0.2,
+      messages: [
+        {
+          role: 'system',
+          content: `You are a foreign-trade product translator. Translate from ${fromLabel} to ${toLabel}. Keep product codes, numbers, units and line breaks unchanged. Text in the form [[W0]], [[W1]] is protected; reproduce every placeholder exactly and do not translate it. Return only the translation, no explanation.`,
+        },
+        { role: 'user', content: text },
+      ],
+    }),
+  });
+  if (!res.ok) throw new Error(`LLM_HTTP_${res.status}`);
+  const data = await res.json() as any;
+  const out = data?.choices?.[0]?.message?.content;
+  if (!out) throw new Error('LLM_EMPTY');
+  return String(out).trim();
+}
+
+function translationConfigFor(ownerId: string): TranslationConfig {
+  return normalizeTranslationConfig(store.getUserSettings(ownerId).translation);
+}
+
+function makeExportTranslator(ownerId: string, config: TranslationConfig): TranslateFn {
+  const order = config.priority === 'free-local-llm'
+    ? ['free', 'local', 'llm']
+    : config.priority === 'llm-local-free'
+      ? ['llm', 'local', 'free']
+      : ['local', 'free', 'llm'];
+  return async ({ text, maskedText, masks, from, to }) => {
+    for (const engine of order) {
+      if (engine === 'local') {
+        for (const pair of config.dictPairs) {
+          const out = from === 'zh' && pair.zh === text
+            ? pair.es
+            : from === 'es' && pair.es === text
+              ? pair.zh
+              : null;
+          if (out && restoreWhitelist(out, { masked: maskedText, masks }) !== null) return out;
+        }
+        continue;
+      }
+      if (engine === 'free') {
+        if (!config.freeEnabled || maskedText.length > 500) continue;
+        if (freeCharsUsed(ownerId) + maskedText.length > FREE_DAILY_CHARS) continue;
+        try {
+          const out = await callMyMemory(maskedText, from, to);
+          if (!out || restoreWhitelist(out, { masked: maskedText, masks }) === null) continue;
+          addFreeChars(ownerId, maskedText.length);
+          return out;
+        } catch (e: any) {
+          app.log.warn({ err: e?.message, ownerId }, 'free translation failed during export');
+        }
+        continue;
+      }
+      if (maskedText.length > 2000) continue;
+      try {
+        const out = await callLlm(ownerId, maskedText, from, to);
+        if (!out || restoreWhitelist(out, { masked: maskedText, masks }) === null) continue;
+        return out;
+      } catch (e: any) {
+        app.log.warn({ err: e?.message, ownerId }, 'LLM translation failed during export');
+      }
+    }
+    return null;
+  };
+}
+
+interface ExportContext {
+  ownerId: string;
+  config: TranslationConfig;
+  translate: TranslateFn;
+}
+
+function exportContextFor(ownerId: string): ExportContext {
+  const config = translationConfigFor(ownerId);
+  return { ownerId, config, translate: makeExportTranslator(ownerId, config) };
+}
+
+function emptySummary(): ExportTranslationSummary {
+  return { translated: 0, originalPair: 0, unknown: 0, failed: 0, empty: 0 };
+}
+function addSummary(summary: ExportTranslationSummary, result: BilingualResult): void {
+  if (result.status === 'original_pair') summary.originalPair += 1;
+  else summary[result.status] += 1;
+}
+
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  async function worker(): Promise<void> {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      out[index] = await fn(items[index]!, index);
+    }
+  }
+  const workers = Array.from({ length: Math.min(Math.max(1, limit), items.length) }, () => worker());
+  await Promise.all(workers);
+  return out;
+}
+
 const loginKeys = generateKeyPairSync('rsa', { modulusLength: 2048 });
 const loginPublicJwk = loginKeys.publicKey.export({ format: 'jwk' });
 
@@ -119,21 +266,30 @@ app.get('/api/me', async (req, reply) => {
   return { ok: true, id: u.id, user: user?.username ?? u.id, role: u.role };
 });
 
+app.get('/api/translation-settings', async (req, reply) => {
+  if (!a.require(req, reply)) return;
+  const ownerId = currentUser(req).id;
+  return { ...translationConfigFor(ownerId), configured: !!store.getUserSettings(ownerId).translation };
+});
+
+app.put('/api/translation-settings', async (req, reply) => {
+  if (!a.require(req, reply)) return;
+  const config = normalizeTranslationConfig(req.body);
+  await store.updateUserSettings(currentUser(req).id, { translation: config });
+  return { ...config, configured: true };
+});
+
 app.post('/api/free-translate', async (req, reply) => {
   if (!a.require(req, reply)) return;
   const body = req.body as { text?: string; from?: string; to?: string } | undefined;
   const text = (body?.text ?? '').trim();
   if (!text) return reply.code(400).send({ error: 'EMPTY_TEXT' });
   if (text.length > 500) return reply.code(413).send({ error: 'TOO_LONG' });
-  const langpair = body?.from === 'es' ? 'es|zh' : 'zh|es';
+  const from = body?.from === 'es' ? 'es' : 'zh';
+  const to = from === 'es' ? 'zh' : 'es';
   try {
-    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(langpair)}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
-    if (!res.ok) return reply.code(502).send({ error: 'FREE_FAILED' });
-    const data = await res.json() as any;
-    const out = data?.responseData?.translatedText;
-    if (!out) return reply.code(502).send({ error: 'FREE_EMPTY' });
-    return { text: String(out).trim(), source: 'mymemory' };
+    const out = await callMyMemory(text, from, to);
+    return { text: out, source: 'mymemory' };
   } catch (e: any) {
     return reply.code(502).send({ error: 'FREE_FAILED', message: e?.message ?? 'free translate failed' });
   }
@@ -141,35 +297,21 @@ app.post('/api/free-translate', async (req, reply) => {
 
 app.post('/api/translate', async (req, reply) => {
   if (!a.require(req, reply)) return;
-  const llm = store.getUserSettings(currentUser(req).id).llm;
-  const base = llm?.baseURL || llmBase;
-  const key = llm?.apiKey || llmKey;
-  const model = llm?.model || llmModel;
-  if (!base || !key) return reply.code(501).send({ error: 'LLM_NOT_CONFIGURED', message: '未配置大模型，请在设置中填写 API Key' });
+  const ownerId = currentUser(req).id;
+  const llm = store.getUserSettings(ownerId).llm;
+  if (!(llm?.baseURL || llmBase) || !(llm?.apiKey || llmKey)) {
+    return reply.code(501).send({ error: 'LLM_NOT_CONFIGURED', message: '未配置大模型，请在设置中填写 API Key' });
+  }
   const body = req.body as { text?: string; from?: string; to?: string } | undefined;
   const text = (body?.text ?? '').trim();
   if (!text) return reply.code(400).send({ error: 'EMPTY_TEXT' });
   if (text.length > 2000) return reply.code(413).send({ error: 'TOO_LONG' });
-  const from = body?.from === 'es' ? 'Spanish' : 'Chinese';
-  const to = body?.to === 'zh' ? 'Chinese' : 'Spanish';
+  const from = body?.from === 'es' ? 'es' : 'zh';
+  const to = from === 'es' ? 'zh' : 'es';
   try {
-    const res = await fetch(`${base}/chat/completions`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model,
-        temperature: 0.2,
-        messages: [
-          { role: 'system', content: `You are a foreign-trade product translator. Translate from ${from} to ${to}. Keep product codes, numbers, units and line breaks. Return only the translation, no explanation.` },
-          { role: 'user', content: text },
-        ],
-      }),
-    });
-    if (!res.ok) return reply.code(502).send({ error: 'LLM_FAILED', message: `LLM HTTP ${res.status}` });
-    const data = await res.json() as any;
-    const out = data?.choices?.[0]?.message?.content;
+    const out = await callLlm(ownerId, text, from, to);
     if (!out) return reply.code(502).send({ error: 'LLM_EMPTY' });
-    return { text: String(out).trim() };
+    return { text: out };
   } catch (e: any) {
     return reply.code(502).send({ error: 'LLM_FAILED', message: e?.message ?? 'LLM request failed' });
   }
@@ -449,7 +591,43 @@ async function cleanupExports(): Promise<void> {
   }
 }
 
-async function makeXlsx(records: any[]): Promise<Buffer> {
+interface XlsxResult {
+  buffer: Buffer;
+  summary: ExportTranslationSummary;
+}
+
+async function makeXlsx(records: any[], contextForRecord: (record: any) => ExportContext): Promise<XlsxResult> {
+  const summary = emptySummary();
+  const contexts = new Map<string, ExportContext>();
+  const caches = new Map<string, Map<string, string | null>>();
+  function contextOf(record: any): ExportContext {
+    const context = contextForRecord(record);
+    const cached = contexts.get(context.ownerId);
+    if (cached) return cached;
+    contexts.set(context.ownerId, context);
+    return context;
+  }
+  const descriptions = await mapLimit(records, 3, async (r): Promise<BilingualResult> => {
+    try {
+      const context = contextOf(r);
+      let cache = caches.get(context.ownerId);
+      if (!cache) {
+        cache = new Map<string, string | null>();
+        caches.set(context.ownerId, cache);
+      }
+      return await resolveBilingualFields(r.values, {
+        whitelist: context.config.whitelist,
+        translate: context.translate,
+        cache,
+      });
+    } catch (e: any) {
+      app.log.warn({ err: e?.message, recordId: r.id }, 'description normalisation failed');
+      const es = String(r.values?.desEs ?? '').trim();
+      const zh = String(r.values?.desZh ?? '').trim();
+      return { c: es, d: zh, sourceLang: 'unknown', status: 'failed', cjk: 0, latin: 0 };
+    }
+  });
+
   const workbook = new ExcelJS.Workbook();
   workbook.creator = '外贸水印相机';
   workbook.created = new Date();
@@ -464,6 +642,7 @@ async function makeXlsx(records: any[]): Promise<Buffer> {
     { header: 'CUANTAS CAJAS', key: 'cajas', width: 16 },
     { header: 'CUBICO', key: 'volumen', width: 14 },
     { header: 'PESO', key: 'peso', width: 14 },
+    { header: '翻译状态', key: 'translationStatus', width: 14, hidden: true },
   ];
   const header = sheet.getRow(1);
   header.height = 28;
@@ -471,15 +650,22 @@ async function makeXlsx(records: any[]): Promise<Buffer> {
   header.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2563EB' } };
   header.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
   header.eachCell((c) => { c.border = { bottom: { style: 'thin', color: { argb: 'FFD1D5DB' } } }; });
-  for (const r of records) {
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i]!;
+    const description: BilingualResult = descriptions[i]
+      ?? { c: '', d: '', sourceLang: 'unknown', status: 'empty', cjk: 0, latin: 0 };
+    addSummary(summary, description);
     const row = sheet.addRow({
-      codigo: r.values.modelo ?? '', detallados: r.values.desEs ?? '', desZh: r.values.desZh ?? '',
+      codigo: r.values.modelo ?? '',
+      detallados: description.c,
+      desZh: description.d,
       precio: r.values.precio ?? '', pzs: r.values.pzs ?? '', cajas: r.values.cajas ?? '',
       volumen: r.values.volumen ?? '', peso: r.values.peso ?? '',
+      translationStatus: translationStatusText(description.status),
     });
     row.height = 190;
     row.alignment = { vertical: 'middle', wrapText: true };
-    for (let i = 1; i <= 9; i++) row.getCell(i).border = { bottom: { style: 'hair', color: { argb: 'FFE5E7EB' } } };
+    for (let i = 1; i <= 10; i++) row.getCell(i).border = { bottom: { style: 'hair', color: { argb: 'FFE5E7EB' } } };
     const img = await buffer(await storage.getObject(r.renderKey));
     const photo = await loadImage(img);
     const scale = Math.min(1, 1800 / Math.max(photo.width, photo.height));
@@ -497,7 +683,7 @@ async function makeXlsx(records: any[]): Promise<Buffer> {
     sheet.addImage(imageId, { tl: { col: 0.1, row: row.number - 1 + 0.04 }, ext: { width: Math.round(drawW), height: Math.round(drawH) }, editAs: 'oneCell' });
   }
   const data = await workbook.xlsx.writeBuffer();
-  return Buffer.from(data);
+  return { buffer: Buffer.from(data), summary };
 }
 
 async function makeZip(records: any[]): Promise<Buffer> {
@@ -524,7 +710,15 @@ async function runExportJob(id: string) {
     job.status = 'running';
     const allowed = job.ids ? new Set(job.ids) : null;
     const records = store.listRecords().filter((r) => !allowed || allowed.has(r.id));
-    const data = job.type === 'zip' ? await makeZip(records) : await makeXlsx(records);
+    let data: Buffer;
+    if (job.type === 'zip') {
+      data = await makeZip(records);
+    } else {
+      const ownerId = job.ownerId ?? store.getUserByUsername('admin')?.id ?? '';
+      const built = await makeXlsx(records, (r) => exportContextFor(r.ownerId ?? ownerId));
+      data = built.buffer;
+      job.translation = built.summary;
+    }
     const key = `export/${id}.${job.type === 'zip' ? 'zip' : 'xlsx'}`;
     await storage.putObject(key, data, { contentType: job.type === 'zip' ? 'application/zip' : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     job.key = key;
@@ -703,61 +897,11 @@ app.get('/api/export.xlsx', async (req, reply) => {
   if (records.length === 0) return reply.code(404).send({ error: 'NOT_FOUND' });
   if (records.length > 300) return reply.code(413).send({ error: 'TOO_MANY', message: '单次最多导出 300 条' });
 
-  const workbook = new ExcelJS.Workbook();
-  workbook.creator = '外贸水印相机';
-  workbook.created = new Date();
-  const sheet = workbook.addWorksheet('Fotos', { views: [{ state: 'frozen', ySplit: 1 }] });
-  sheet.columns = [
-    { header: 'FOTO', key: 'foto', width: 28 },
-    { header: 'CODIGO', key: 'codigo', width: 20 },
-    { header: 'DETALLADOS', key: 'detallados', width: 42 },
-    { header: '描述', key: 'desZh', width: 42 },
-    { header: 'PRECIO', key: 'precio', width: 14 },
-    { header: 'CANTIDAD DE CAJA', key: 'pzs', width: 18 },
-    { header: 'CUANTAS CAJAS', key: 'cajas', width: 16 },
-    { header: 'CUBICO', key: 'volumen', width: 14 },
-    { header: 'PESO', key: 'peso', width: 14 },
-  ];
-  const header = sheet.getRow(1);
-  header.height = 26;
-  header.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
-  header.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2563EB' } };
-  header.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
-  header.eachCell((c) => { c.border = { bottom: { style: 'thin', color: { argb: 'FFD1D5DB' } } }; });
-
-  for (const r of records) {
-    const row = sheet.addRow({
-      codigo: r.values.modelo ?? '',
-      detallados: r.values.desEs ?? '',
-      desZh: r.values.desZh ?? '',
-      precio: r.values.precio ?? '',
-      pzs: r.values.pzs ?? '',
-      cajas: r.values.cajas ?? '',
-      volumen: r.values.volumen ?? '',
-      peso: r.values.peso ?? '',
-    });
-    row.height = 108;
-    row.alignment = { vertical: 'middle', wrapText: true };
-    for (let i = 1; i <= 9; i++) {
-      row.getCell(i).border = { bottom: { style: 'hair', color: { argb: 'FFE5E7EB' } } };
-    }
-    const img = await buffer(await storage.getObject(r.renderKey));
-    const photo = await loadImage(img);
-    const ratio = photo.width / photo.height;
-    let drawW = 280, drawH = drawW / ratio;
-    if (drawH > 190) { drawH = 190; drawW = drawH * ratio; }
-    const imageId = workbook.addImage({ buffer: Buffer.from(img) as any, extension: 'jpeg' });
-    sheet.addImage(imageId, {
-      tl: { col: 0.15, row: row.number - 1 + 0.08 },
-      ext: { width: Math.round(drawW), height: Math.round(drawH) },
-      editAs: 'oneCell',
-    });
-  }
-
-  const data = await workbook.xlsx.writeBuffer();
+  const me = currentUser(req).id;
+  const built = await makeXlsx(records, (r) => exportContextFor(r.ownerId ?? me));
   reply.header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   reply.header('Content-Disposition', `attachment; filename="watermark-${Date.now()}.xlsx"`);
-  return reply.send(Buffer.from(data));
+  return reply.send(built.buffer);
 });
 
 app.get('/api/export.zip', async (req, reply) => {

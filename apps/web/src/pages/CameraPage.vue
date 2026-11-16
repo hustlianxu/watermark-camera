@@ -92,6 +92,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from 'vue';
+import { syncTranslationSettings } from '../translationConfig';
 import { useRouter } from 'vue-router';
 import { drawWatermark, makeSpec, type Position, type WatermarkTemplate } from '@wc/core';
 import { api, type FolderItem, type Template } from '../api';
@@ -633,6 +634,7 @@ watch([values, position, scale, opacity, widthRatio, customX, customY], () => {
 watch(templateId, (id) => { try { localStorage.setItem('wc:last-template', id); } catch {} });
 
 onActivated(async () => {
+  void syncTranslationSettings().catch(() => {});
   if (videoEl.value && stream.value) {
     await videoEl.value.play().catch(() => {});
     drawOverlay();
@@ -644,6 +646,7 @@ onDeactivated(() => {
 });
 
 onMounted(async () => {
+  await syncTranslationSettings().catch(() => {});
   await loadTemplates();
   await refreshPending();
   await startCamera();

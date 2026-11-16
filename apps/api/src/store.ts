@@ -38,6 +38,14 @@ export interface ShareItem {
   expiresAt: number;
 }
 
+export interface ExportTranslationSummary {
+  translated: number;
+  originalPair: number;
+  unknown: number;
+  failed: number;
+  empty: number;
+}
+
 export interface ExportItem {
   id: string;
   type: 'xlsx' | 'zip';
@@ -49,6 +57,7 @@ export interface ExportItem {
   key?: string;
   size?: number;
   error?: string;
+  translation?: ExportTranslationSummary;
   createdAt: number;
   expiresAt: number;
 }
@@ -67,6 +76,12 @@ export interface User {
 
 export interface UserSettings {
   llm?: { provider: string; baseURL: string; model: string; apiKey: string };
+  translation?: {
+    priority: 'local-free-llm' | 'free-local-llm' | 'llm-local-free';
+    freeEnabled: boolean;
+    dictPairs: { zh: string; es: string }[];
+    whitelist: string[];
+  };
 }
 
 interface DB {

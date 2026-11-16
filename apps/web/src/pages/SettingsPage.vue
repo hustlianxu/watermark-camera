@@ -154,6 +154,12 @@
 import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { api } from '../api';
+import {
+  readLocalTranslationSettings,
+  saveTranslationSettings,
+  syncTranslationSettings,
+  type TranslationPriority,
+} from '../translationConfig';
 
 const router = useRouter();
 const activeSection = ref('');
@@ -209,23 +215,21 @@ function openSection(id: string) {
 }
 function todayKey() { return new Date().toISOString().slice(0, 10); }
 function loadLocalConfig() {
-  try {
-    const pairs = JSON.parse(localStorage.getItem('wc:dict-pairs') || '[]');
-    if (Array.isArray(pairs) && pairs.length) dictRows.value = pairs;
-    else {
-      const legacy = JSON.parse(localStorage.getItem('wc:dict') || '{}');
-      dictRows.value = Object.entries(legacy).map(([zh, es]) => ({ zh, es: String(es) }));
-    }
-  } catch { dictRows.value = []; }
-  if (!dictRows.value.length) dictRows.value = [{ zh: '', es: '' }];
-  try {
-    const words = JSON.parse(localStorage.getItem('wc:whitelist-phrases') || '[]');
-    whitelist.value = Array.isArray(words) ? words : [];
-  } catch { whitelist.value = []; }
+  const local = readLocalTranslationSettings();
+  priority.value = local.priority;
+  freeEnabled.value = local.freeEnabled;
+  dictRows.value = local.dictPairs.length ? local.dictPairs : [{ zh: '', es: '' }];
+  whitelist.value = local.whitelist;
   try {
     const usage = JSON.parse(localStorage.getItem('wc:free-usage') || '{}');
     freeUsed.value = usage.date === todayKey() ? Number(usage.chars) || 0 : 0;
   } catch { freeUsed.value = 0; }
+}
+async function syncFromServer() {
+  try {
+    await syncTranslationSettings();
+    loadLocalConfig();
+  } catch {}
 }
 async function loadLlm() {
   try {
@@ -287,15 +291,22 @@ async function saveLlm() {
   } catch (e: any) { toast.value = '保存失败：' + (e.message || '未知'); }
 }
 
-function saveTranslation() {
-  priority.value = priority.value || 'local-free-llm';
-  localStorage.setItem('wc:trans-priority', priority.value);
-  localStorage.setItem('wc:free-enabled', freeEnabled.value ? '1' : '0');
-  const pairs = dictRows.value.filter((r) => r.zh.trim() && r.es.trim());
-  localStorage.setItem('wc:dict-pairs', JSON.stringify(pairs));
-  localStorage.setItem('wc:whitelist-phrases', JSON.stringify(whitelist.value));
-  toast.value = '翻译设置已保存';
-  setTimeout(() => { toast.value = ''; }, 2000);
+async function saveTranslation() {
+  const value = {
+    priority: (priority.value || 'local-free-llm') as TranslationPriority,
+    freeEnabled: freeEnabled.value,
+    dictPairs: dictRows.value
+      .map((r) => ({ zh: r.zh.trim(), es: r.es.trim() }))
+      .filter((r) => r.zh && r.es),
+    whitelist: [...new Set(whitelist.value.map((w) => w.trim()).filter(Boolean))],
+  };
+  try {
+    await saveTranslationSettings(value, me.value?.id);
+    toast.value = '翻译设置已保存，并同步到当前账号';
+  } catch (e: any) {
+    toast.value = '已保存到本机，账号同步失败：' + (e.message || '网络错误');
+  }
+  setTimeout(() => { toast.value = ''; }, 3000);
 }
 function addWord() {
   const w = newWord.value.trim();
@@ -360,5 +371,5 @@ async function logout() {
   await api('/api/logout', { method: 'POST' });
   await router.replace('/login');
 }
-onMounted(() => { loadLocalConfig(); void loadLlm(); void loadMe(); });
+onMounted(() => { loadLocalConfig(); void syncFromServer(); void loadLlm(); void loadMe(); });
 </script>
