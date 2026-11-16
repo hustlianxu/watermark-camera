@@ -1,3 +1,4 @@
+import { DEFAULT_WHITELIST } from '@wc/core';
 import { api } from './api';
 
 export type TranslationPriority = 'local-free-llm' | 'free-local-llm' | 'llm-local-free';
@@ -7,6 +8,7 @@ export interface TranslationSettings {
   freeEnabled: boolean;
   dictPairs: { zh: string; es: string }[];
   whitelist: string[];
+  whitelistVersion?: number;
 }
 
 export interface RemoteTranslationSettings extends TranslationSettings {
@@ -17,7 +19,8 @@ const DEFAULT_SETTINGS: TranslationSettings = {
   priority: 'local-free-llm',
   freeEnabled: true,
   dictPairs: [],
-  whitelist: ['USB', 'Type-C'],
+  whitelist: [...DEFAULT_WHITELIST],
+  whitelistVersion: 2,
 };
 
 function parseArray<T>(raw: string | null): T[] {
@@ -39,9 +42,13 @@ export function readLocalTranslationSettings(): TranslationSettings {
     } catch {}
   }
   const rawWhitelist = localStorage.getItem('wc:whitelist-phrases');
-  const whitelist = (rawWhitelist === null ? DEFAULT_SETTINGS.whitelist : parseArray<string>(rawWhitelist))
+  const version = Number(localStorage.getItem('wc:whitelist-version') || 0);
+  let whitelist = (rawWhitelist === null ? DEFAULT_SETTINGS.whitelist : parseArray<string>(rawWhitelist))
     .map((x) => String(x).trim())
     .filter(Boolean);
+  // One-time migration for pre-versioned local lists: add the new built-ins
+  // while preserving the user's own additions. After v2, deletions stick.
+  if (rawWhitelist !== null && version < 2) whitelist = [...DEFAULT_WHITELIST, ...whitelist];
   return {
     priority: (localStorage.getItem('wc:trans-priority') as TranslationPriority) || DEFAULT_SETTINGS.priority,
     freeEnabled: localStorage.getItem('wc:free-enabled') !== '0',
@@ -49,6 +56,7 @@ export function readLocalTranslationSettings(): TranslationSettings {
       .map((x) => ({ zh: String(x.zh ?? '').trim(), es: String(x.es ?? '').trim() }))
       .filter((x) => x.zh && x.es),
     whitelist: [...new Set(whitelist)],
+    whitelistVersion: 2,
   };
 }
 
@@ -57,6 +65,7 @@ export function writeLocalTranslationSettings(value: TranslationSettings): void 
   localStorage.setItem('wc:free-enabled', value.freeEnabled ? '1' : '0');
   localStorage.setItem('wc:dict-pairs', JSON.stringify(value.dictPairs));
   localStorage.setItem('wc:whitelist-phrases', JSON.stringify(value.whitelist));
+  localStorage.setItem('wc:whitelist-version', '2');
 }
 
 function hasCustomSettings(value: TranslationSettings): boolean {
@@ -96,6 +105,7 @@ export function syncTranslationSettings(): Promise<void> {
         freeEnabled: remote.freeEnabled,
         dictPairs: remote.dictPairs,
         whitelist: remote.whitelist,
+        whitelistVersion: 2,
       });
       if (userId) localStorage.setItem(OWNER_KEY, userId);
       return;

@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 import { auth, hashPassword, verifyPassword } from './auth.js';
 import { randomBytes } from 'node:crypto';
-import { JsonStore, type ExportItem, type ExportTranslationSummary } from './store.js';
+import { JsonStore, type CaptureSettings, type ExportItem, type ExportTranslationSummary } from './store.js';
 import { getBuiltinTemplates, renderClean, renderRecord } from './render.js';
 import { createStorage, storageConfigFromEnv } from '@wc/storage';
 import {
@@ -119,7 +119,7 @@ async function callLlm(ownerId: string, text: string, from: 'zh' | 'es', to: 'zh
       messages: [
         {
           role: 'system',
-          content: `You are a foreign-trade product translator. Translate from ${fromLabel} to ${toLabel}. Keep product codes, numbers, units and line breaks unchanged. Text in the form [[W0]], [[W1]] is protected; reproduce every placeholder exactly and do not translate it. Return only the translation, no explanation.`,
+          content: `You are a foreign-trade product translator. Translate from ${fromLabel} to ${toLabel}. Keep product codes, numbers, units and line breaks unchanged. Text in the form [[0]], [[1]] is protected; reproduce every placeholder exactly and do not translate it. Return only the translation, no explanation.`,
         },
         { role: 'user', content: text },
       ],
@@ -134,6 +134,28 @@ async function callLlm(ownerId: string, text: string, from: 'zh' | 'es', to: 'zh
 
 function translationConfigFor(ownerId: string): TranslationConfig {
   return normalizeTranslationConfig(store.getUserSettings(ownerId).translation);
+}
+
+const DEFAULT_CAPTURE_SETTINGS: CaptureSettings = { saveLocal: true, syncRemote: true, excelExportRequired: false };
+
+function captureSettingsFor(ownerId: string): CaptureSettings {
+  const saved = store.getUserSettings(ownerId).capture;
+  const hasXlsxExport = store.listExports(ownerId).some((e) => e.type === 'xlsx');
+  const excelExportRequired = !!saved?.excelExportRequired || hasXlsxExport;
+  return {
+    saveLocal: saved?.saveLocal !== false,
+    // Excel reads remote records; once used, remote sync is a hard requirement.
+    syncRemote: excelExportRequired ? true : saved?.syncRemote !== false,
+    excelExportRequired,
+  };
+}
+
+async function markExcelExportRequired(ownerId: string): Promise<void> {
+  const current = captureSettingsFor(ownerId);
+  if (current.excelExportRequired) return;
+  await store.updateUserSettings(ownerId, {
+    capture: { ...current, excelExportRequired: true },
+  });
 }
 
 function makeExportTranslator(ownerId: string, config: TranslationConfig): TranslateFn {
@@ -277,6 +299,34 @@ app.put('/api/translation-settings', async (req, reply) => {
   const config = normalizeTranslationConfig(req.body);
   await store.updateUserSettings(currentUser(req).id, { translation: config });
   return { ...config, configured: true };
+});
+
+app.get('/api/capture-settings', async (req, reply) => {
+  if (!a.require(req, reply)) return;
+  return captureSettingsFor(currentUser(req).id);
+});
+
+app.put('/api/capture-settings', async (req, reply) => {
+  if (!a.require(req, reply)) return;
+  const ownerId = currentUser(req).id;
+  const current = captureSettingsFor(ownerId);
+  const body = req.body as Partial<CaptureSettings> | undefined;
+  const next: CaptureSettings = {
+    saveLocal: typeof body?.saveLocal === 'boolean' ? body.saveLocal : current.saveLocal,
+    syncRemote: typeof body?.syncRemote === 'boolean' ? body.syncRemote : current.syncRemote,
+    excelExportRequired: current.excelExportRequired,
+  };
+  if (!next.saveLocal && !next.syncRemote) {
+    return reply.code(409).send({ error: 'AT_LEAST_ONE_DESTINATION', message: '“保存本地”和“同步远程”至少保留一个' });
+  }
+  if (current.excelExportRequired && !next.syncRemote) {
+    return reply.code(409).send({
+      error: 'REMOTE_SYNC_REQUIRED',
+      message: '该账号已使用 Excel 导出，Excel 依赖远程数据，不能关闭“同步远程”',
+    });
+  }
+  await store.updateUserSettings(ownerId, { capture: next });
+  return next;
 });
 
 app.post('/api/free-translate', async (req, reply) => {
@@ -844,10 +894,18 @@ app.post('/api/exports', async (req, reply) => {
   const records = store.listRecords(scopeOwner(req)).filter((r) => !allowed || allowed.has(r.id));
   if (!records.length) return reply.code(404).send({ error: 'NOT_FOUND' });
   if (records.length > 300) return reply.code(413).send({ error: 'TOO_MANY', message: '单次最多 300 条' });
+  const ownerId = currentUser(req).id;
+  if (type === 'xlsx' && !captureSettingsFor(ownerId).syncRemote) {
+    return reply.code(409).send({
+      error: 'REMOTE_SYNC_REQUIRED',
+      message: 'Excel 导出依赖远程数据，请先在“设置 → 拍照保存”开启“同步远程”',
+    });
+  }
+  if (type === 'xlsx') await markExcelExportRequired(ownerId);
   const id = randomUUID();
   const ttlDays = store.getSettings().exportTtlDays;
   const item: ExportItem = {
-    id, type, status: 'queued', ids: records.map((r) => r.id), ownerId: currentUser(req).id,
+    id, type, status: 'queued', ids: records.map((r) => r.id), ownerId,
     count: records.length, createdAt: Date.now(), expiresAt: Date.now() + ttlDays * 86400000,
   };
   await store.addExport(item);
@@ -896,8 +954,14 @@ app.get('/api/export.xlsx', async (req, reply) => {
   const records = store.listRecords(scopeOwner(req)).filter((r) => !wanted || wanted.has(r.id));
   if (records.length === 0) return reply.code(404).send({ error: 'NOT_FOUND' });
   if (records.length > 300) return reply.code(413).send({ error: 'TOO_MANY', message: '单次最多导出 300 条' });
-
   const me = currentUser(req).id;
+  if (!captureSettingsFor(me).syncRemote) {
+    return reply.code(409).send({
+      error: 'REMOTE_SYNC_REQUIRED',
+      message: 'Excel 导出依赖远程数据，请先在“设置 → 拍照保存”开启“同步远程”',
+    });
+  }
+  await markExcelExportRequired(me);
   const built = await makeXlsx(records, (r) => exportContextFor(r.ownerId ?? me));
   reply.header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   reply.header('Content-Disposition', `attachment; filename="watermark-${Date.now()}.xlsx"`);

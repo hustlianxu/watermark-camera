@@ -1,3 +1,7 @@
+import { DEFAULT_WHITELIST, maskWhitelist, normalizeWhitelist, restoreWhitelist, type MaskedText, type MaskPair } from '@wc/core';
+
+export { DEFAULT_WHITELIST, maskWhitelist, normalizeWhitelist, restoreWhitelist, type MaskedText, type MaskPair } from '@wc/core';
+
 export type Language = 'zh' | 'es' | 'unknown';
 export type TranslationPriority = 'local-free-llm' | 'free-local-llm' | 'llm-local-free';
 export type BilingualStatus = 'empty' | 'translated' | 'original_pair' | 'unknown' | 'failed';
@@ -12,16 +16,8 @@ export interface TranslationConfig {
   freeEnabled: boolean;
   dictPairs: DictPair[];
   whitelist: string[];
-}
-
-export interface MaskPair {
-  phrase: string;
-  token: string;
-}
-
-export interface MaskedText {
-  masked: string;
-  masks: MaskPair[];
+  /** Bumped when the built-in list changes, so first-run migration can merge. */
+  whitelistVersion?: number;
 }
 
 export interface TranslateInput {
@@ -54,13 +50,14 @@ export interface ResolveOptions {
   cache?: Map<string, string | null>;
 }
 
-export const DEFAULT_WHITELIST = ['USB', 'Type-C'];
+export const CURRENT_WHITELIST_VERSION = 2;
 
 export const DEFAULT_TRANSLATION_CONFIG: TranslationConfig = {
   priority: 'local-free-llm',
   freeEnabled: true,
   dictPairs: [],
   whitelist: [...DEFAULT_WHITELIST],
+  whitelistVersion: CURRENT_WHITELIST_VERSION,
 };
 
 const CJK_RE = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/g;
@@ -74,56 +71,6 @@ function asText(value: unknown): string {
 
 export function isPlaceholder(value: unknown): boolean {
   return PLACEHOLDER_RE.test(asText(value));
-}
-
-/** Remove duplicate/blank whitelist terms. Case-sensitive, longest-first at use time. */
-export function normalizeWhitelist(words: unknown): string[] {
-  if (!Array.isArray(words)) return [];
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const word of words) {
-    const value = asText(word).slice(0, 120);
-    if (!value || seen.has(value)) continue;
-    seen.add(value);
-    out.push(value);
-  }
-  return out.slice(0, 500);
-}
-
-/**
- * Replace whitelist phrases with stable placeholders before sending text to a
- * translation engine. Repeated phrases share one placeholder.
- */
-export function maskWhitelist(text: string, whitelist: unknown): MaskedText {
-  const masks: MaskPair[] = [];
-  let masked = String(text ?? '');
-  const words = normalizeWhitelist(whitelist).sort((a, b) => b.length - a.length);
-  for (const phrase of words) {
-    if (!masked.includes(phrase)) continue;
-    let token = `[[W${masks.length}]]`;
-    while (masked.includes(token)) token = `_${token}`;
-    masks.push({ phrase, token });
-    masked = masked.split(phrase).join(token);
-  }
-  return { masked, masks };
-}
-
-/**
- * Restore placeholders. Returns null when a translation engine dropped or
- * rewrote a placeholder and no longer preserved the original whitelist phrase.
- */
-export function restoreWhitelist(text: string, masked: MaskedText): string | null {
-  if (!masked.masks.length) return text;
-  const found = masked.masks.filter((m) => text.includes(m.token));
-  if (found.length !== masked.masks.length) {
-    // Some engines (notably a local dictionary hit) may return the phrase
-    // verbatim instead of the placeholder. Accept only if every phrase survived.
-    if (found.length === 0 && masked.masks.every((m) => text.includes(m.phrase))) return text;
-    return null;
-  }
-  let out = text;
-  for (const { phrase, token } of masked.masks) out = out.split(token).join(phrase);
-  return out;
 }
 
 export interface LanguageStats {
@@ -141,7 +88,7 @@ export interface LanguageStats {
  */
 export function analyzeLanguage(text: string, whitelist: unknown = DEFAULT_WHITELIST): LanguageStats {
   let value = maskWhitelist(text, whitelist).masked;
-  value = value.replace(/\[\[W\d+\]\]/g, ' ');
+  value = value.replace(/\[\[\d+\]\]/g, ' ');
   value = value.replace(/\b(?:https?:\/\/|www\.)\S+/gi, ' ');
   value = value.replace(/\b[\w.+-]+@[\w.-]+\.\w{2,}\b/gi, ' ');
   // Numeric product codes / dimensions / sizes: ABC-123, 10x20cm, 6pcs.
@@ -314,12 +261,16 @@ export function normalizeTranslationConfig(input: unknown): TranslationConfig {
       if (zh && es) dictPairs.push({ zh, es });
     }
   }
+  const requested = Array.isArray(value.whitelist) ? normalizeWhitelist(value.whitelist) : [];
+  const isCurrentVersion = Number(value.whitelistVersion) >= CURRENT_WHITELIST_VERSION;
+  const whitelist = isCurrentVersion
+    ? requested
+    : normalizeWhitelist([...DEFAULT_WHITELIST, ...requested]);
   return {
     priority,
     freeEnabled: value.freeEnabled !== false,
     dictPairs,
-    whitelist: Array.isArray(value.whitelist)
-      ? normalizeWhitelist(value.whitelist)
-      : [...DEFAULT_WHITELIST],
+    whitelist,
+    whitelistVersion: CURRENT_WHITELIST_VERSION,
   };
 }

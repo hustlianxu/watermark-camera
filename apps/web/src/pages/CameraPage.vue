@@ -82,7 +82,8 @@
         <p v-if="lastSaved.message" class="hint">{{ lastSaved.message }}</p>
         <div class="row" style="margin-top:10px">
           <button class="btn" @click="closeSaved">继续拍下一张</button>
-          <button v-if="!lastSaved.uploading" class="btn secondary" @click="viewLast">查看详情</button>
+          <button v-if="lastSaved.localBlob" class="btn secondary" @click="saveLastToAlbum">保存到相册</button>
+          <button v-if="!lastSaved.uploading && lastSaved.id" class="btn secondary" @click="viewLast">查看详情</button>
         </div>
       </div>
     </div>
@@ -92,12 +93,16 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from 'vue';
-import { syncTranslationSettings } from '../translationConfig';
+import { readLocalTranslationSettings, syncTranslationSettings } from '../translationConfig';
+import { readLocalCaptureSettings, syncCaptureSettings, type CaptureSettings } from '../captureSettings';
 import { useRouter } from 'vue-router';
-import { drawWatermark, makeSpec, type Position, type WatermarkTemplate } from '@wc/core';
+import { drawWatermark, makeSpec, maskWhitelist, restoreWhitelist, type Position, type WatermarkTemplate } from '@wc/core';
 import { api, type FolderItem, type Template } from '../api';
 import type { TemplateField } from '../api';
 import { addPending, countPending, deletePending, listPending, type PendingUpload } from '../offline';
+import { addLocalPhoto, getLocalPhoto, requestPersistentStorage, updateLocalPhoto } from '../localPhotos';
+import { makeLocalPhotoFilename, renderLocalWatermarkedPhoto } from '../localWatermark';
+import { saveBlobToAlbum } from '../saveToAlbum';
 
 const router = useRouter();
 
@@ -127,7 +132,16 @@ const styleOpen = ref(false);
 const activeField = ref<TemplateField | null>(null);
 const inlineStyle = ref<Record<string,string>>({});
 const zoom = ref(1);
-const lastSaved = ref<{ id: string; imageUrl: string; uploading?: boolean; message?: string; token?: string } | null>(null);
+const lastSaved = ref<{
+  id: string;
+  imageUrl: string;
+  uploading?: boolean;
+  message?: string;
+  token?: string;
+  localId?: string;
+  localBlob?: Blob;
+} | null>(null);
+const captureSettings = ref<CaptureSettings>(readLocalCaptureSettings());
 const reuseWatermark = ref(localStorage.getItem('wc:reuse-watermark') === '1');
 const pointers = new Map<number, { x: number; y: number }>();
 let pinch: { dist: number; scale: number } | null = null;
@@ -463,34 +477,113 @@ async function refreshPending() {
   try { pendingCount.value = await countPending(); } catch {}
 }
 
+async function markLocalPhotoSynced(localId: string | undefined, remoteId: string): Promise<void> {
+  if (!localId) return;
+  try {
+    const photo = await getLocalPhoto(localId);
+    if (!photo) return;
+    photo.remoteId = remoteId;
+    await updateLocalPhoto(photo);
+  } catch {}
+}
+
 async function flushPending() {
-  if (!navigator.onLine) return;
+  if (!navigator.onLine || !captureSettings.value.syncRemote) return;
   let sent = 0;
   for (const item of await listPending()) {
-    try { await sendUpload(item); await deletePending(item.id); sent++; } catch { break; }
+    try {
+      const rec = await sendUpload(item);
+      await markLocalPhotoSynced(item.localPhotoId, rec.id);
+      await deletePending(item.id);
+      sent++;
+    } catch { break; }
   }
   await refreshPending();
   if (sent > 0) { toast.value = `已补传 ${sent} 张`; setTimeout(() => { toast.value = ''; }, 3000); }
 }
 
+async function syncCaptureConfig() {
+  try { captureSettings.value = await syncCaptureSettings(); } catch {}
+}
+
 async function uploadBlob(blob: Blob, valuesOverride?: Record<string, string>) {
+  const settings = { ...captureSettings.value };
+  if (!settings.saveLocal && !settings.syncRemote) {
+    toast.value = '“保存本地”和“同步远程”至少开启一个';
+    return;
+  }
   busy.value = true;
   const item = makePending(blob);
   if (valuesOverride) item.values = { ...valuesOverride };
-  const localUrl = URL.createObjectURL(blob);
   const token = crypto.randomUUID ? crypto.randomUUID() : String(Date.now());
-  lastSaved.value = { id: '', imageUrl: localUrl, uploading: true, token };
+  let localUrl = URL.createObjectURL(blob);
+  let localBlob: Blob | undefined;
+  let localId: string | undefined;
+  let localError = '';
+
+  if (settings.saveLocal) {
+    try {
+      const template = templates.value.find((t) => t.id === item.templateId);
+      if (!template) throw new Error('TEMPLATE_NOT_FOUND');
+      const rendered = await renderLocalWatermarkedPhoto(blob, template, item.values, {
+        position: (item.spec.position as Position) ?? position.value,
+        x: (item.spec.x as number | null) ?? null,
+        y: (item.spec.y as number | null) ?? null,
+        scale: Number(item.spec.scale ?? 1),
+        heightScale: Number(item.spec.heightScale ?? 1),
+        opacity: Number(item.spec.opacity ?? 0.85),
+        widthRatio: Number(item.spec.widthRatio ?? template.widthRatio),
+      });
+      localId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+      localBlob = rendered.blob;
+      item.localPhotoId = localId;
+      await addLocalPhoto({
+        id: localId,
+        blob: rendered.blob,
+        filename: makeLocalPhotoFilename(localId),
+        createdAt: Date.now(),
+        width: rendered.width,
+        height: rendered.height,
+      });
+      void requestPersistentStorage().catch(() => {});
+      URL.revokeObjectURL(localUrl);
+      localUrl = URL.createObjectURL(rendered.blob);
+    } catch {
+      localError = '本机备份失败';
+    }
+  }
+
+  lastSaved.value = {
+    id: '',
+    imageUrl: localUrl,
+    uploading: settings.syncRemote,
+    token,
+    localId,
+    localBlob,
+    message: !settings.syncRemote ? '已保存到本机（未同步远程）' : localError || undefined,
+  };
   if (!reuseWatermark.value) resetContent();
   busy.value = false;
 
+  if (!settings.syncRemote) {
+    toast.value = '已保存到本机，未同步远程';
+    setTimeout(() => { toast.value = ''; }, 3000);
+    return;
+  }
+
   try {
     const rec = await sendUpload(item) as any;
-    URL.revokeObjectURL(localUrl);
+    await markLocalPhotoSynced(localId, rec.id);
     if (lastSaved.value?.token === token) {
+      if (!localId) URL.revokeObjectURL(localUrl);
       lastSaved.value = {
         id: rec.id,
-        imageUrl: `/api/files/render/${rec.id}?v=${Date.now()}`,
+        imageUrl: localId ? localUrl : `/api/files/render/${rec.id}?v=${Date.now()}`,
         uploading: false,
+        localId,
+        localBlob,
+        message: localError || undefined,
+        token,
       };
     }
   } catch (e: any) {
@@ -499,13 +592,32 @@ async function uploadBlob(blob: Blob, valuesOverride?: Record<string, string>) {
       await addPending(item);
       await refreshPending();
       if (lastSaved.value?.token === token) {
-        lastSaved.value = { id: '', imageUrl: localUrl, uploading: false, message: '网络不可用，已离线保存，联网后自动补传', token };
+        lastSaved.value = {
+          id: '', imageUrl: localUrl, uploading: false, token, localId, localBlob,
+          message: localId ? '网络不可用，本机已备份，联网后自动补传' : '网络不可用，已离线保存，联网后自动补传',
+        };
       }
     } else {
       if (lastSaved.value?.token === token) {
-        lastSaved.value = { id: '', imageUrl: localUrl, uploading: false, message: '上传失败：' + (e.message || '未知'), token };
+        lastSaved.value = {
+          id: '', imageUrl: localUrl, uploading: false, token, localId, localBlob,
+          message: (localId ? '本机已备份；' : '') + '上传失败：' + (e.message || '未知'),
+        };
       }
     }
+  }
+}
+
+async function saveLastToAlbum() {
+  const current = lastSaved.value;
+  if (!current?.localBlob) return;
+  try {
+    const result = await saveBlobToAlbum(current.localBlob, makeLocalPhotoFilename(current.localId || 'local'));
+    if (result === 'shared') toast.value = '已打开系统分享面板，请选择“存储图像/保存到相册”';
+    else if (result === 'downloaded') toast.value = '已开始下载水印照片';
+    if (result !== 'cancelled') setTimeout(() => { toast.value = ''; }, 3000);
+  } catch {
+    toast.value = '无法打开分享面板，请到“本地备份”里下载';
   }
 }
 
@@ -513,30 +625,19 @@ async function translateField(key: string) {
   const sourceKey = key === 'desEs' ? 'desZh' : 'desEs';
   const text = values.value[sourceKey]?.trim();
   if (!text) { toast.value = '请先填写另一种语言的描述'; return; }
-  const priority = localStorage.getItem('wc:trans-priority') || 'local-free-llm';
-  const whitelist: string[] = JSON.parse(localStorage.getItem('wc:whitelist-phrases') || '[]');
-  if (whitelist.some((w) => w && text === w)) { toast.value = '该词组在白名单中，不翻译'; return; }
-  const freeEnabled = localStorage.getItem('wc:free-enabled') !== '0';
-  let dict: { zh: string; es: string }[] = [];
-  try { dict = JSON.parse(localStorage.getItem('wc:dict-pairs') || '[]'); } catch {}
+  const config = readLocalTranslationSettings();
+  const { priority, whitelist, dictPairs: dict, freeEnabled } = config;
+  if (whitelist.includes(text)) { toast.value = '该词组在白名单中，不翻译'; return; }
   const order = priority === 'free-local-llm' ? ['free', 'local', 'llm']
     : priority === 'llm-local-free' ? ['llm', 'local', 'free']
     : ['local', 'free', 'llm'];
-  const masks: string[] = [];
-  let masked = text;
-  for (const w of whitelist.filter(Boolean).sort((a, b) => b.length - a.length)) {
-    if (masked.includes(w)) {
-      const token = `[[W${masks.length}]]`;
-      masks.push(w);
-      masked = masked.split(w).join(token);
-    }
-  }
-  const restore = (s: string) => masks.reduce((acc, w, i) => acc.split(`[[W${i}]]`).join(w), s);
+  const maskedInfo = maskWhitelist(text, whitelist);
+  const masked = maskedInfo.masked;
 
   const tryLocal = (): string | null => {
     for (const row of dict) {
-      if (row.zh === text) return row.es;
-      if (row.es === text) return row.zh;
+      const candidate = row.zh === text ? row.es : row.es === text ? row.zh : null;
+      if (candidate && restoreWhitelist(candidate, maskedInfo)) return candidate;
     }
     return null;
   };
@@ -572,8 +673,9 @@ async function translateField(key: string) {
       else result = await tryLLM();
       if (result) break;
     }
-    if (result) {
-      values.value[key] = restore(result);
+    const restored = result ? restoreWhitelist(result, maskedInfo) : null;
+    if (restored) {
+      values.value[key] = restored;
       redraw();
     } else {
       toast.value = '翻译失败：本地/免费/大模型都没有结果';
@@ -635,6 +737,7 @@ watch(templateId, (id) => { try { localStorage.setItem('wc:last-template', id); 
 
 onActivated(async () => {
   void syncTranslationSettings().catch(() => {});
+  void syncCaptureConfig();
   if (videoEl.value && stream.value) {
     await videoEl.value.play().catch(() => {});
     drawOverlay();
@@ -647,6 +750,7 @@ onDeactivated(() => {
 
 onMounted(async () => {
   await syncTranslationSettings().catch(() => {});
+  await syncCaptureConfig();
   await loadTemplates();
   await refreshPending();
   await startCamera();

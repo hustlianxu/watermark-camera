@@ -74,6 +74,13 @@ export interface User {
   createdAt: number;
 }
 
+export interface CaptureSettings {
+  saveLocal: boolean;
+  syncRemote: boolean;
+  /** Set once an Excel export is requested; Excel reads remote records. */
+  excelExportRequired?: boolean;
+}
+
 export interface UserSettings {
   llm?: { provider: string; baseURL: string; model: string; apiKey: string };
   translation?: {
@@ -82,6 +89,7 @@ export interface UserSettings {
     dictPairs: { zh: string; es: string }[];
     whitelist: string[];
   };
+  capture?: CaptureSettings;
 }
 
 interface DB {

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   analyzeLanguage,
+  DEFAULT_WHITELIST,
   detectLanguage,
   maskWhitelist,
   normalizeTranslationConfig,
@@ -19,6 +20,24 @@ describe('language detection', () => {
     expect(detectLanguage('六个大星星')).toBe('zh');
     expect(detectLanguage('seis estrellas grandes')).toBe('es');
     expect(detectLanguage('Español con acentos: á é í ó ú ñ ü')).toBe('es');
+  });
+
+  it('ships a broad built-in whitelist for units, currencies and abbreviations', () => {
+    expect(DEFAULT_WHITELIST).toEqual(expect.arrayContaining([
+      'm³', '㎡', 'kg', 'g', 'L', 'l', 'ml', 'pzs', 'pzas', 'pcs', 'pc',
+      'ctn', 'ctns', 'cajas', 'caja', 'unidades', 'uds',
+      'rmb', 'RMB', 'usd', 'USD', 'eur', 'EUR', '¥', '$', '€',
+      'RGB', 'LED', 'USB', 'DC', 'AC', 'W', 'V', 'ma', 'HZ',
+    ]));
+    expect(maskWhitelist('10kg 5g 3pcs 20W 5V 100ma 50HZ ¥99 $5 €3', DEFAULT_WHITELIST).masked)
+      .not.toMatch(/kg|pcs|20W|100ma|50HZ|¥|\$|€/);
+  });
+
+  it('uses word boundaries so short units do not eat normal words', () => {
+    const masked = maskWhitelist('grande 10kg pcs pc cajas caja LED USB Type-C', DEFAULT_WHITELIST);
+    expect(masked.masked).toContain('grande');
+    expect(masked.masked).not.toMatch(/10kg|pcs|pc|cajas|caja|LED|USB|Type-C/);
+    expect(restoreWhitelist(masked.masked, masked)).toBe('grande 10kg pcs pc cajas caja LED USB Type-C');
   });
 
   it('ignores whitelist phrases and product codes', () => {
@@ -90,7 +109,7 @@ describe('bilingual column normalisation', () => {
       desZh: '大星星 USB Type-C',
     }, {
       whitelist: ['USB', 'Type-C'],
-      translate: async ({ maskedText }) => `[[W0]] [[W1]] ${maskedText.replace(/大星星/g, 'grandes estrellas')}`,
+      translate: async ({ maskedText }) => `[[0]] [[1]] ${maskedText.replace(/大星星/g, 'grandes estrellas')}`,
     });
     expect(result.d).toBe('大星星 USB Type-C');
     expect(result.c).toContain('USB');
@@ -171,9 +190,11 @@ describe('bilingual column normalisation', () => {
 describe('translation config', () => {
   it('uses the built-in proper-noun whitelist for a fresh account', () => {
     const config = normalizeTranslationConfig(undefined);
-    expect(config.whitelist).toEqual(['USB', 'Type-C']);
-    const configured = normalizeTranslationConfig({ whitelist: [] });
-    expect(configured.whitelist).toEqual([]);
+    expect(config.whitelist).toEqual(DEFAULT_WHITELIST);
+    const cleared = normalizeTranslationConfig({ whitelist: [], whitelistVersion: 2 });
+    expect(cleared.whitelist).toEqual([]);
+    const legacy = normalizeTranslationConfig({ whitelist: ['USB'] });
+    expect(legacy.whitelist).toEqual(expect.arrayContaining(['USB', 'kg', 'pzs', '¥']));
   });
 
   it('sanitises values and limits list sizes', () => {
@@ -181,11 +202,13 @@ describe('translation config', () => {
       priority: 'free-local-llm',
       freeEnabled: false,
       whitelist: [' USB ', 'USB', '', 'Type-C'],
+      whitelistVersion: 2,
       dictPairs: [{ zh: '大星星', es: 'estrella' }, { zh: '', es: 'x' }],
     });
     expect(config.priority).toBe('free-local-llm');
     expect(config.freeEnabled).toBe(false);
     expect(config.whitelist).toEqual(['USB', 'Type-C']);
+    expect(config.whitelistVersion).toBe(2);
     expect(config.dictPairs).toEqual([{ zh: '大星星', es: 'estrella' }]);
   });
 });

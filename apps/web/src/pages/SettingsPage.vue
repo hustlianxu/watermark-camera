@@ -14,6 +14,11 @@
           <b>管理后台</b>
           <small>电脑端批量管理</small>
         </a>
+        <a href="/local" class="setting-tile">
+          <span class="setting-icon">🗂️</span>
+          <b>本地备份</b>
+          <small>不依赖服务器</small>
+        </a>
       </div>
     </div>
 
@@ -79,6 +84,29 @@
         </div>
 
         <button class="btn" style="margin-top:16px" @click="saveTranslation">保存翻译设置</button>
+      </template>
+
+      <template v-else-if="activeSection === 'capture'">
+        <strong>拍照保存</strong>
+        <p class="hint">“保存本地”会在当前设备/浏览器留一份带水印的备份；“同步远程”会生成服务器记录，供记录页、分享和 Excel 导出使用。</p>
+        <div class="setting-line">
+          <div>
+            <b>保存本地</b>
+            <div class="hint">自动写入 App 本地备份（IndexedDB），不依赖网络。系统相册需在拍完后点“保存到相册”。</div>
+          </div>
+          <input v-model="saveLocal" type="checkbox" style="width:20px;height:20px" />
+        </div>
+        <div class="setting-line">
+          <div>
+            <b>同步远程</b>
+            <div class="hint">关闭后新照片只在本机，不出现在记录/分享/Excel 导出中。</div>
+            <div v-if="excelExportRequired" class="hint" style="color:#b45309">该账号已使用 Excel 导出；Excel 依赖远程数据，因此此开关已锁定。</div>
+          </div>
+          <input v-model="syncRemote" type="checkbox" :disabled="excelExportRequired" style="width:20px;height:20px" />
+        </div>
+        <p v-if="!saveLocal && !syncRemote" class="hint" style="color:#b91c1c">至少开启一个，避免照片无处保存。</p>
+        <button class="btn" style="margin-top:16px" @click="saveCapture">保存拍照设置</button>
+        <button class="btn secondary" style="margin-top:10px" @click="router.push('/local')">打开本地备份</button>
       </template>
 
       <template v-else-if="activeSection === 'reuse'">
@@ -160,12 +188,21 @@ import {
   syncTranslationSettings,
   type TranslationPriority,
 } from '../translationConfig';
+import {
+  readLocalCaptureSettings,
+  saveCaptureSettings,
+  syncCaptureSettings,
+  type CaptureSettings,
+} from '../captureSettings';
 
 const router = useRouter();
 const activeSection = ref('');
 const reuse = ref(localStorage.getItem('wc:reuse-watermark') === '1');
 const priority = ref(localStorage.getItem('wc:trans-priority') || 'local-free-llm');
 const freeEnabled = ref(localStorage.getItem('wc:free-enabled') !== '0');
+const saveLocal = ref(true);
+const syncRemote = ref(true);
+const excelExportRequired = ref(false);
 const dictRows = ref<{ zh: string; es: string }[]>([]);
 const whitelist = ref<string[]>([]);
 const newWord = ref('');
@@ -202,6 +239,7 @@ const newUserPassword = ref('');
 
 const sections = [
   { id: 'translation', name: '翻译', icon: '🌐', desc: '词典 / 免费 / 大模型' },
+  { id: 'capture', name: '拍照保存', icon: '💾', desc: '本地 / 远程' },
   { id: 'reuse', name: '水印复用', icon: '🔁', desc: '拍完是否保留内容' },
   { id: 'shares', name: '分享链接', icon: '🔗', desc: '查看/撤回' },
   { id: 'account', name: '账户', icon: '👤', desc: '登录/退出' },
@@ -291,6 +329,39 @@ async function saveLlm() {
   } catch (e: any) { toast.value = '保存失败：' + (e.message || '未知'); }
 }
 
+function applyCaptureSettings(value: CaptureSettings) {
+  saveLocal.value = value.saveLocal;
+  excelExportRequired.value = value.excelExportRequired === true;
+  syncRemote.value = excelExportRequired.value ? true : value.syncRemote;
+}
+function loadCaptureConfig() {
+  applyCaptureSettings(readLocalCaptureSettings());
+}
+async function syncCapture() {
+  try {
+    applyCaptureSettings(await syncCaptureSettings());
+  } catch {}
+}
+async function saveCapture() {
+  if (!saveLocal.value && !syncRemote.value) {
+    toast.value = '“保存本地”和“同步远程”至少保留一个';
+    return;
+  }
+  try {
+    const saved = await saveCaptureSettings({
+      saveLocal: saveLocal.value,
+      syncRemote: syncRemote.value,
+      excelExportRequired: excelExportRequired.value,
+    }, me.value?.id);
+    applyCaptureSettings(saved);
+    toast.value = '拍照保存设置已保存';
+  } catch (e: any) {
+    loadCaptureConfig();
+    toast.value = e.message || '保存失败';
+  }
+  setTimeout(() => { toast.value = ''; }, 3000);
+}
+
 async function saveTranslation() {
   const value = {
     priority: (priority.value || 'local-free-llm') as TranslationPriority,
@@ -371,5 +442,5 @@ async function logout() {
   await api('/api/logout', { method: 'POST' });
   await router.replace('/login');
 }
-onMounted(() => { loadLocalConfig(); void syncFromServer(); void loadLlm(); void loadMe(); });
+onMounted(() => { loadLocalConfig(); loadCaptureConfig(); void syncFromServer(); void syncCapture(); void loadLlm(); void loadMe(); });
 </script>

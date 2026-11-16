@@ -7,6 +7,8 @@ export interface PendingUpload {
   values: Record<string, string>;
   spec: Record<string, unknown>;
   createdAt: number;
+  /** Link back to the local album copy so it can be marked as synced later. */
+  localPhotoId?: string;
 }
 
 const DB_NAME = 'wc-offline';
