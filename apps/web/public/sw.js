@@ -1,4 +1,4 @@
-const CACHE = 'wc-shell-v6';
+const CACHE = 'wc-shell-v7';
 const IMAGE_CACHE = 'wc-images-v3';
 const ASSETS = ['/', '/manifest.webmanifest'];
 

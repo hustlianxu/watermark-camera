@@ -20,15 +20,47 @@
         </div>
       </div>
 
-      <div v-if="cameraError" class="camera-error">
-        {{ cameraError }}
-        <button class="btn secondary" @click="startCamera">重试相机</button>
+      <div v-if="cameraProblem" class="camera-error">
+        <div class="camera-error-card">
+          <strong>{{ cameraProblem.title }}</strong>
+          <p>{{ cameraProblem.detail }}</p>
+          <ol v-if="cameraProblem.steps.length" class="camera-steps">
+            <li v-for="step in cameraProblem.steps" :key="step">{{ step }}</li>
+          </ol>
+          <div class="camera-error-actions">
+            <button v-if="cameraProblem.retry" class="btn" @click="startCamera">重试相机</button>
+            <label class="btn secondary">
+              从相册导入
+              <input type="file" accept="image/*" style="display:none" @change="onFile" />
+            </label>
+            <label class="btn secondary">
+              用系统相机
+              <input type="file" accept="image/*" capture="environment" style="display:none" @change="onFile" />
+            </label>
+            <button class="btn secondary" @click="copyCameraDiagnostics">复制诊断</button>
+          </div>
+          <p class="hint">改完权限后重新点“重试相机”；必要时刷新页面。</p>
+        </div>
+      </div>
+
+      <div v-else-if="cameraActivation" class="camera-error">
+        <div class="camera-error-card">
+          <strong>开启相机</strong>
+          <p>点击下方按钮，浏览器会请求相机权限。也可以直接从相册导入照片。</p>
+          <div class="camera-error-actions">
+            <button class="btn" @click="startCamera">开启相机</button>
+            <label class="btn secondary">
+              从相册导入
+              <input type="file" accept="image/*" style="display:none" @change="onFile" />
+            </label>
+          </div>
+        </div>
       </div>
 
       <div class="camera-controls">
         <label class="ctrl-btn" @click="saveTemplateState(); localStorage.setItem('wc:last-template', templateId)">
           相册
-          <input type="file" accept="image/*" capture="environment" style="display:none" @change="onFile" />
+          <input type="file" accept="image/*" style="display:none" @change="onFile" />
         </label>
         <button class="shutter" :disabled="busy" @click="capture" :aria-label="busy ? '处理中' : '拍照'"></button>
         <button class="ctrl-btn" @click="styleOpen = true">样式</button>
@@ -103,6 +135,18 @@ import { addPending, countPending, deletePending, listPending, type PendingUploa
 import { addLocalPhoto, getLocalPhoto, requestPersistentStorage, updateLocalPhoto } from '../localPhotos';
 import { makeLocalPhotoFilename, renderLocalWatermarkedPhoto } from '../localWatermark';
 import { saveBlobToAlbum } from '../saveToAlbum';
+import {
+  cameraDiagnostics,
+  cameraScopeProblem,
+  describeCameraError,
+  permissionProblem,
+  queryCameraPermission,
+  rememberCameraGrant,
+  rememberedCameraGrant,
+  requestCameraStream,
+  type CameraPermissionState,
+  type CameraProblem,
+} from '../camera';
 
 const router = useRouter();
 
@@ -123,7 +167,9 @@ const values = ref<Record<string, string>>({});
 const videoEl = ref<HTMLVideoElement | null>(null);
 const overlayEl = ref<HTMLCanvasElement | null>(null);
 const stream = ref<MediaStream | null>(null);
-const cameraError = ref('');
+const cameraProblem = ref<CameraProblem | null>(null);
+const cameraActivation = ref(false);
+const cameraPermission = ref<CameraPermissionState>('unknown');
 const busy = ref(false);
 const toast = ref('');
 const pendingCount = ref(0);
@@ -233,20 +279,66 @@ function onPositionChange() { customX.value = null; customY.value = null; redraw
 function setZoom(n: number) { zoom.value = Math.min(4, Math.max(1, Math.round(n * 10) / 10)); }
 
 async function startCamera() {
-  cameraError.value = '';
+  cameraProblem.value = null;
+  cameraActivation.value = false;
+  const scopeProblem = cameraScopeProblem(window);
+  if (scopeProblem) {
+    cameraProblem.value = scopeProblem;
+    return;
+  }
   try {
     stopCamera();
-    stream.value = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
-    });
+    stream.value = await requestCameraStream();
+    cameraPermission.value = 'granted';
+    rememberCameraGrant(true);
     if (videoEl.value) {
       videoEl.value.srcObject = stream.value;
       await videoEl.value.play().catch(() => {});
       drawOverlay();
     }
-  } catch (e: any) {
-    cameraError.value = '无法打开相机：' + (e?.message || e?.name || '未知错误') + '。可用“相册”导入。';
+  } catch (e: unknown) {
+    const problem = describeCameraError(e);
+    cameraProblem.value = problem;
+    if (problem.kind === 'permission') {
+      cameraPermission.value = 'denied';
+      rememberCameraGrant(false);
+    }
+  }
+}
+
+async function prepareCamera() {
+  const scopeProblem = cameraScopeProblem(window);
+  if (scopeProblem) {
+    cameraProblem.value = scopeProblem;
+    return;
+  }
+  cameraPermission.value = await queryCameraPermission();
+  if (cameraPermission.value === 'granted'
+    || (cameraPermission.value === 'unknown' && rememberedCameraGrant())) {
+    await startCamera();
+    return;
+  }
+  if (cameraPermission.value === 'denied') {
+    cameraProblem.value = permissionProblem();
+    return;
+  }
+  cameraActivation.value = true;
+}
+
+async function copyCameraDiagnostics() {
+  const text = cameraDiagnostics({
+    href: location.href,
+    userAgent: navigator.userAgent,
+    isSecureContext: window.isSecureContext,
+    permission: cameraPermission.value,
+    problem: cameraProblem.value,
+  });
+  try {
+    await navigator.clipboard.writeText(text);
+    toast.value = '诊断信息已复制';
+    setTimeout(() => { toast.value = ''; }, 2500);
+  } catch {
+    window.prompt('复制诊断信息', text);
   }
 }
 
@@ -741,6 +833,8 @@ onActivated(async () => {
   if (videoEl.value && stream.value) {
     await videoEl.value.play().catch(() => {});
     drawOverlay();
+  } else if (!cameraProblem.value) {
+    void prepareCamera();
   }
 });
 onDeactivated(() => {
@@ -753,8 +847,8 @@ onMounted(async () => {
   await syncCaptureConfig();
   await loadTemplates();
   await refreshPending();
-  await startCamera();
-  await flushPending();
+  await prepareCamera();
+  void flushPending();
   window.addEventListener('online', flushPending);
 });
 onBeforeUnmount(() => {
